@@ -87,16 +87,12 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
-    sglang_args = (
+    vllm_args = (
         "--rollout-num-gpus-per-engine 2 "
         "--rollout-num-gpus 8 "
-        "--sglang-mem-fraction-static 0.8 "
-        "--sglang-cuda-graph-max-bs 8 "
-        "--sglang-enable-metrics "
-        "--sglang-speculative-algorithm EAGLE "
-        "--sglang-speculative-num-steps 2 "
-        "--sglang-speculative-eagle-topk 1 "
-        "--sglang-speculative-num-draft-tokens 3 "
+        "--vllm-gpu-memory-utilization 0.8 "
+        "--vllm-max-cudagraph-capture-size 8 "
+        "--vllm-speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}' "
     )
 
     # Enable MTP training with loss scaling
@@ -126,7 +122,7 @@ def execute():
         f"{grpo_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{perf_args} "
-        f"{sglang_args} "
+        f"{vllm_args} "
         f"{mtp_args} "
         f"{ci_args} "
         f"{misc_args} "

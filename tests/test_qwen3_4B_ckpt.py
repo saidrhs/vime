@@ -89,9 +89,17 @@ def execute(mode: str = ""):
         "--optimizer-cpu-offload "
         "--overlap-cpu-optimizer-d2h-h2d "
         "--use-precision-aware-optimizer "
+        # PAO + cpu-offload (HybridDeviceOptimizer) shards are not equal-length
+        # across save/load ranks under the default dp_reshardable (bucket-centric)
+        # sharding, so dist-ckpt load fails with
+        # "Cannot merge two lists with different lengths (81 and 79)".
+        # fully_reshardable is model-centric and immune to bucket-layout changes;
+        # verified on the r3 image (Megatron 0.16.0rc0) that save+load both pass.
+        # This is the flag described in PR #50 that never actually landed.
+        "--dist-ckpt-optim-fully-reshardable "
     )
 
-    sglang_args = "--rollout-num-gpus-per-engine 2 --sglang-mem-fraction-static 0.8 --sglang-cuda-graph-max-bs 32 "
+    vllm_args = "--rollout-num-gpus-per-engine 2 --vllm-gpu-memory-utilization 0.8 --vllm-max-cudagraph-capture-size 32 "
 
     ci_args = "--ci-test "
 
@@ -116,7 +124,7 @@ def execute(mode: str = ""):
         f"{ppo_args} "
         f"{U.get_default_wandb_args(__file__)} "
         f"{perf_args} "
-        f"{sglang_args} "
+        f"{vllm_args} "
         f"{ci_args} "
         f"{misc_args} "
     )

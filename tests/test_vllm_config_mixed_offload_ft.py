@@ -1,3 +1,15 @@
+"""E2E test: mixed offload with fault tolerance.
+
+Same two-model layout as test_vllm_config_mixed_offload.py but with
+fault tolerance enabled.  --ci-test triggers a simulated engine crash
+on the updatable (actor) server, testing:
+  - Health monitor detects crash and marks engine as None
+  - RolloutServer.recover() restarts the dead engine
+  - Updatable engines: offload → resume_memory_occupation → update_weights
+  - Non-updatable engines: offload → update_weights_from_disk
+  - Training continues after recovery
+"""
+
 import os
 import tempfile
 
@@ -9,23 +21,21 @@ MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_TYPE = "qwen2.5-0.5B"
 NUM_GPUS = 8
 
-# Inline sglang config: same model, 3 engine groups with different parallelism.
-# Non-colocated (decoupled training and rollout): actor uses 4 GPUs, rollout uses 4 GPUs.
-# Group 1: 2 GPUs, 2 GPUs/engine (tp=2) → 1 engine
-# Group 2: 1 GPU,  1 GPU/engine  (tp=1) → 1 engine
-# Group 3: 1 GPU,  placeholder   → reserves 1 GPU slot, no engine created
-SGLANG_CONFIG_YAML = """\
-sglang:
-  - name: default
+# Two models on 8 GPUs (colocate): actor gets weight updates, ref is frozen.
+VLLM_CONFIG_YAML = """\
+vllm:
+  - name: actor
+    update_weights: true
     server_groups:
       - worker_type: regular
-        num_gpus: 2
-        num_gpus_per_engine: 2
-      - worker_type: regular
-        num_gpus: 1
+        num_gpus: 4
         num_gpus_per_engine: 1
-      - worker_type: placeholder
-        num_gpus: 1
+  - name: ref
+    update_weights: false
+    server_groups:
+      - worker_type: regular
+        num_gpus: 4
+        num_gpus_per_engine: 1
 """
 
 
@@ -36,9 +46,10 @@ def prepare():
 
 
 def execute():
-    # Write inline sglang config to a temp file
-    config_file = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix="sglang_config_", delete=False)
-    config_file.write(SGLANG_CONFIG_YAML)
+    config_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", prefix="vllm_mixed_offload_ft_", delete=False
+    )
+    config_file.write(VLLM_CONFIG_YAML)
     config_file.flush()
     config_path = config_file.name
 
@@ -54,10 +65,8 @@ def execute():
         "--num-rollout 3 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 4 "
-        "--rollout-max-response-len 1024 "
+        "--rollout-max-response-len 512 "
         "--rollout-temperature 0.8 "
-        "--over-sampling-batch-size 16 "
-        "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
         "--global-batch-size 32 "
     )
 
@@ -65,7 +74,7 @@ def execute():
         "--eval-interval 20 "
         "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
         "--n-samples-per-eval-prompt 1 "
-        "--eval-max-response-len 1024 "
+        "--eval-max-response-len 512 "
         "--eval-top-k 1 "
     )
 
@@ -77,7 +86,7 @@ def execute():
         "--expert-model-parallel-size 1 "
         "--expert-tensor-parallel-size 1 "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 9216 "
+        "--max-tokens-per-gpu 4096 "
     )
 
     grpo_args = (
@@ -87,7 +96,6 @@ def execute():
         "--kl-loss-type low_var_kl "
         "--entropy-coef 0.00 "
         "--eps-clip 0.2 "
-        "--eps-clip-high 0.28 "
     )
 
     optimizer_args = (
@@ -99,17 +107,23 @@ def execute():
         "--adam-beta2 0.98 "
     )
 
-    sglang_args = (
+    vllm_args = (
         "--rollout-num-gpus-per-engine 1 "
-        f"--sglang-mem-fraction-static {0.6 if TIGHT_DEVICE_MEMORY else 0.7} "
-        "--sglang-enable-metrics "
-        "--sglang-cuda-graph-max-bs 32 "
-        f"--sglang-config {config_path} "
+        f"--vllm-gpu-memory-utilization {0.6 if TIGHT_DEVICE_MEMORY else 0.7} "
+        "--vllm-max-num-seqs 32 "
+        "--vllm-max-cudagraph-capture-size 32 "
+        f"--vllm-config {config_path} "
     )
 
     ci_args = "--ci-test "
 
-    # Non-colocated: actor 4 GPUs, rollout 4 GPUs (separate)
+    fault_tolerance_args = (
+        "--use-fault-tolerance "
+        "--rollout-health-check-interval 5 "
+        "--rollout-health-check-timeout 10 "
+        "--rollout-health-check-first-wait 0 "
+    )
+
     misc_args = (
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
@@ -117,8 +131,8 @@ def execute():
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
         "--actor-num-nodes 1 "
-        "--actor-num-gpus-per-node 4 "
-        "--rollout-num-gpus 4 "
+        "--actor-num-gpus-per-node 8 "
+        "--colocate "
         "--megatron-to-hf-mode bridge "
     )
 
@@ -130,8 +144,9 @@ def execute():
         f"{U.get_default_wandb_args(__file__)} "
         f"{perf_args} "
         f"{eval_args} "
-        f"{sglang_args} "
+        f"{vllm_args} "
         f"{ci_args} "
+        f"{fault_tolerance_args} "
         f"{misc_args} "
     )
 
