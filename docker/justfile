@@ -1,44 +1,78 @@
-release-primary:
-    ARG_TAG_POSTFIX="" ARG_BUILD_EXTRA_ARGS="" just _release-raw
+# Release images publish to the company hub `inferactinc/public` as multi-arch
+# manifests, exactly like upstream `vllm/vllm-openai:nightly`: ONE tag carries
+# both the linux/amd64 and linux/arm64 digests and `docker pull` auto-selects
+# the platform. No arch suffix is ever published as a tag.
+#
+# CUDA 12.9 is the default, so it carries NO cu marker in the tag (like
+# slimerl/slime). Only the non-default cu13 variant is suffixed.
+#
+# The CUDA + source-built FA/TE images can't be cross-emulated, so each arch is
+# built on its own native host and pushed BY DIGEST (no tag lands in the hub),
+# then the two digests are fused into the final tag with `just manifest`.
+#
+# Tag scheme (mirrors slime's `nightly-dev-<date>` + `latest`):
+#   inferactinc/public:vime-<version>        immutable, multi-arch (cu12.9)
+#   inferactinc/public:vime-latest           rolling,   multi-arch (cu12.9)
+#   inferactinc/public:vime-cu13-<version>   immutable, multi-arch (cu13 variant)
+#   inferactinc/public:vime-cu13-latest      rolling,   multi-arch (cu13 variant)
+# <version> comes from docker/version.txt.
 
-# Should be executed on ARM machines.
-# Inherits the Dockerfile's default cu129 BASE_IMAGE; that tag is a multi-arch
-# manifest, so docker selects the arm64 image automatically on an ARM host.
-release-cu129-arm64:
-    ARG_TAG_POSTFIX="-cu129-arm64" ARG_BUILD_EXTRA_ARGS="" just _release-raw
+IMAGE := "inferactinc/public"
+BUILDER := "vime-builder"
 
-# Should be executed on ARM machines.
-# The default-CUDA vLLM tag (no cuXXX suffix) already ships CUDA 13.0;
-# ENABLE_CUDA_13 then builds the CUDA-13 TransformerEngine/Triton on top.
-release-cu13-arm64:
-    ARG_TAG_POSTFIX="-cu13-arm64" ARG_BUILD_EXTRA_ARGS='--build-arg BASE_IMAGE=vllm/vllm-openai:v0.22.0-ubuntu2404 --build-arg ENABLE_CUDA_13=1' just _release-raw
+# ---- per-arch build, pushed BY DIGEST (run once on an amd64 host, once on an arm64 host) ----
 
-_release-raw:
+# Default — cu12.9, no cu marker in the tag.
+build:
+    ARG_TAG_SUFFIX="" ARG_BUILD_EXTRA_ARGS="" just _build-digest
+
+# cu13 variant — vLLM default-CUDA base; ENABLE_CUDA_13 builds the CUDA-13
+# TransformerEngine/Triton on top.
+build-cu13:
+    ARG_TAG_SUFFIX="-cu13" ARG_BUILD_EXTRA_ARGS='--build-arg BASE_IMAGE=vllm/vllm-openai:v0.22.0-ubuntu2404 --build-arg ENABLE_CUDA_13=1' just _build-digest
+
+_build-digest:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+    META="/tmp/vime${ARG_TAG_SUFFIX}-$(uname -m).json"
+
+    # push-by-digest requires the docker-container buildx driver.
+    docker buildx inspect {{BUILDER}} >/dev/null 2>&1 || docker buildx create --name {{BUILDER}} --driver docker-container
+
+    docker buildx build --builder {{BUILDER}} --platform "$PLATFORM" -f docker/Dockerfile $ARG_BUILD_EXTRA_ARGS --build-arg HTTP_PROXY="$http_proxy" --build-arg HTTPS_PROXY="$https_proxy" --build-arg NO_PROXY="localhost,127.0.0.1" -o "type=image,name={{IMAGE}},push-by-digest=true,push=true" --metadata-file "$META" .
+
+    echo "Pushed vime${ARG_TAG_SUFFIX} ${PLATFORM} by digest — pass this to \`just manifest\`:"
+    jq -r '."containerimage.digest"' "$META"
+
+# ---- fuse the two per-arch digests into one multi-arch tag ----
+# Run once after `build` (or `build-cu13`) has pushed on BOTH hosts, passing the
+# digests it printed. For the default cu12.9 image leave VARIANT empty:
+#   just manifest "" sha256:<amd64> sha256:<arm64>     -> vime-<version> + vime-latest
+#   just manifest cu13 sha256:<amd64> sha256:<arm64>   -> vime-cu13-<version> + vime-cu13-latest
+manifest VARIANT AMD_DIGEST ARM_DIGEST:
     #!/bin/bash
     set -euxo pipefail
     cd ..
 
     VERSION="$(cat docker/version.txt | tr -d '\n')"
-    IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+    SUFFIX=""
+    [ -n "{{VARIANT}}" ] && SUFFIX="-{{VARIANT}}"
+    docker buildx imagetools create -t "{{IMAGE}}:vime${SUFFIX}-${VERSION}" -t "{{IMAGE}}:vime${SUFFIX}-latest" "{{IMAGE}}@{{AMD_DIGEST}}" "{{IMAGE}}@{{ARM_DIGEST}}"
 
-    docker build -f docker/Dockerfile . --build-arg HTTP_PROXY="$http_proxy" --build-arg HTTPS_PROXY="$https_proxy" --build-arg NO_PROXY="localhost,127.0.0.1" $ARG_BUILD_EXTRA_ARGS -t aosheninferact/vime-vllm:$IMAGE_TAG
-    docker push aosheninferact/vime-vllm:$IMAGE_TAG
-
-    if [ -z "${ARG_TAG_POSTFIX}" ]; then
-        docker tag aosheninferact/vime-vllm:$IMAGE_TAG aosheninferact/vime-vllm:latest
-        docker push aosheninferact/vime-vllm:latest
-    fi
-
-debug:
+# ---- single-arch test/debug image for the run-ci-image validation job ----
+# slime-test analog; the e2e-test-image runner is x86, so this is amd64-only and
+# needs no manifest.
+build-test:
     #!/bin/bash
     set -euxo pipefail
     cd ..
 
     VERSION="$(cat docker/version.txt | tr -d '\n')"
-    IMAGE_TAG=${VERSION}
+    docker build -f docker/Dockerfile . --build-arg HTTP_PROXY="$http_proxy" --build-arg HTTPS_PROXY="$https_proxy" --build-arg NO_PROXY="localhost,127.0.0.1" -t "{{IMAGE}}:vime-test-${VERSION}"
+    docker push "{{IMAGE}}:vime-test-${VERSION}"
 
-    docker build -f docker/Dockerfile . --build-arg HTTP_PROXY="$http_proxy" --build-arg HTTPS_PROXY="$https_proxy" --build-arg NO_PROXY="localhost,127.0.0.1" -t aosheninferact/vime-vllm-test:$IMAGE_TAG
-    docker push aosheninferact/vime-vllm-test:$IMAGE_TAG
-
-    docker tag aosheninferact/vime-vllm-test:$IMAGE_TAG aosheninferact/vime-vllm-test:latest
-    docker push aosheninferact/vime-vllm-test:latest
+    docker tag "{{IMAGE}}:vime-test-${VERSION}" "{{IMAGE}}:vime-test-latest"
+    docker push "{{IMAGE}}:vime-test-latest"

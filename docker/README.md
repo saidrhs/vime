@@ -1,12 +1,12 @@
 # Docker release rule
 
 vime ships one image based on the official vllm image, published as
-`aosheninferact/vime-vllm:cu129` (also `latest`).
+`inferactinc/public:vime-latest`.
 
 Build locally:
 
 ```bash
-docker build -f docker/Dockerfile -t vime/pr-9-vllm:cu129 .
+docker build -f docker/Dockerfile -t vime .
 ```
 
 ## Release matrix
