@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Qwen3 VL RL training on geo3k dataset with non-colocated vLLM rollout.
-# Uses 4 GPUs for Megatron training and 4 GPUs for vLLM rollout.
+# Qwen3 VL RL training on geo3k dataset with colocated vLLM rollout.
+# Uses the same GPUs for Megatron training and vLLM rollout.
 # Usage: 
 #   VIME_SCRIPT_MODEL_NAME=Qwen3-VL-2B-Instruct ./run_geo3k_vlm.sh
 
@@ -9,9 +9,7 @@
 TRAIN_BACKEND="megatron"
 MODEL_NAME=${VIME_SCRIPT_MODEL_NAME:-"Qwen3-VL-8B-Instruct"}
 DATASET_NAME=${VIME_SCRIPT_DATASET_NAME:-"chenhegu/geo3k_imgurl"}
-TOTAL_GPUS=8
-TRAIN_GPUS=4
-ROLLOUT_GPUS=4
+NUM_GPUS=${VIME_SCRIPT_NUM_GPUS:-8}
 DATASET_LOCAL_NAME=$(basename "$DATASET_NAME")
 
 # Validate MODEL_NAME
@@ -133,11 +131,9 @@ OPTIMIZER_ARGS=(
 )
 
 VLLM_ARGS=(
-   --rollout-num-gpus ${ROLLOUT_GPUS}
    --rollout-num-gpus-per-engine 1
    --vllm-server-concurrency 64
    --vllm-gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
-   --router-policy round_robin
 )
 
 # Wandb args (only if WANDB_API_KEY is set)
@@ -145,7 +141,7 @@ if [ -n "$WANDB_API_KEY" ]; then
    WANDB_ARGS=(
       --use-wandb
       --wandb-project vime-geo3k-vlm
-      --wandb-group ${MODEL_NAME_LOWER}-${TRAIN_BACKEND}-vllm-8gpu-noncolocate
+      --wandb-group ${MODEL_NAME_LOWER}-${TRAIN_BACKEND}-vllm-${NUM_GPUS}gpu-colocate
       --wandb-key ${WANDB_API_KEY}
       --disable-wandb-random-suffix
    )
@@ -153,14 +149,16 @@ else
    WANDB_ARGS=()
 fi
 
-MISC_ARGS=()
+MISC_ARGS=(
+   --colocate
+)
 
 # Backend-specific args
 # megatron backend
 BACKEND_ARGS=(
    --train-backend megatron
    --load /root/models/${MODEL_NAME}
-   --num-gpus-per-node ${TOTAL_GPUS}
+   --num-gpus-per-node ${NUM_GPUS}
    --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
@@ -190,7 +188,7 @@ MODEL_ARGS_ROTARY_BASE=5000000 source "${VIME_DIR}/scripts/models/${MODEL_ARGS_F
 if [ "$USE_EXTERNAL_RAY" = "0" ]; then
    export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
    export no_proxy="127.0.0.1,${MASTER_ADDR}"
-   ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${TOTAL_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+   ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 fi
 
 # Build runtime env
@@ -206,7 +204,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node ${TRAIN_GPUS} \
+   --actor-num-gpus-per-node ${NUM_GPUS} \
    --multimodal-keys "${MULTIMODAL_KEYS}" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
